@@ -9,6 +9,13 @@ from . import ctype_util as ct
 from numpy import random
 from .default import *
 import functools
+import pyautogui
+import imutils
+import cv2
+from . import timeDistributedCNN as timeCNN
+import numpy as np
+from keras.preprocessing.image import img_to_array
+from keras.models import load_model
 
 class CPU(Default):
     _options = [
@@ -25,7 +32,6 @@ class CPU(Default):
       Option('frame_limit', type=int, help="stop after a given number of frames"),
       Option('debug', type=int, default=0),
       Option('tcp', type=int, default=0, help="use zmq over tcp for memory watcher and pipe input"),
-      Option('windows', action='store_true', help="set defaults for windows"),
       Option('enemy_dump', type=int, default=0, help="also dump frames for the enemy"),
     ] + [Option('p%d' % i, type=str, choices=characters.keys(), default="falcon", help="character for player %d" % i) for i in [1, 2]]
     
@@ -57,6 +63,17 @@ class CPU(Default):
         self.cpus = {self.pid: None}
         self.characters = {self.pid: self.agent.char or self.p2}
 
+        # Construct the CRNN model and load its training weights
+        self.model = timeCNN.buildCRNN(4, 150, 150, 3)
+        self.model.load_weights("phillip/crnn_noLSTM.h5")
+
+        # self.benModel = crnn2.buildBenNet()
+        # self.benModel.load_weights("phillip/multiclass_CNN_Locked_NoHUD.h5")
+        self.benModel = load_model("phillip/multiclass_CNN_Locked_NoHUD_NoStocks_Even.h5")
+
+        self.sequences = []
+
+
         if self.enemy:
             enemy_kwargs = util.load_params(self.enemy, 'agent')
             enemy_kwargs.update(
@@ -79,7 +96,6 @@ class CPU(Default):
 
         
         print('Creating MemoryWatcher.')
-        self.tcp = self.tcp or self.windows
         if self.tcp:
           self.mw = mw.MemoryWatcherZMQ(port=5555)
         else:
@@ -162,7 +178,7 @@ class CPU(Default):
         
         try:
             while self.game_frame != self.frame_limit:
-              self.advance_frame()
+                self.advance_frame()
         except KeyboardInterrupt:
             if dolphin_process is not None:
                 dolphin_process.terminate()
@@ -211,6 +227,7 @@ class CPU(Default):
 
             start = time.time()
             self.make_action()
+
             self.thinking_time += time.time() - start
 
             if self.state.frame % (15 * 60) == 0:
@@ -234,6 +251,7 @@ class CPU(Default):
     def make_action(self):
         # menu = Menu(self.state.menu)
         # print(menu)
+
         if self.state.menu == Menu.Game.value:
             self.game_frame += 1
             
@@ -248,11 +266,59 @@ class CPU(Default):
             for pid, pad in zip(self.pids, self.pads):
                 agent = self.agents[pid]
                 if agent:
-                    agent.act(self.state, pad)
+                    # Reset controller to neutral state
+                    pad.send_controller(ssbm.RealControllerState.neutral)
+
+                    # Take screenshot and resize it
+                    img = pyautogui.screenshot()
+                    img = cv2.cvtColor(np.array(img), cv2.COLOR_RGBA2RGB)
+                    resizedImg = cv2.resize(img, (150, 150), interpolation=cv2.INTER_LINEAR)
+
+                    # Add screenshot to queue
+                    self.sequences.insert(0, resizedImg)
+                    print("Number of frames in queue: " + str(len(self.sequences)))
+                    print(np.array(self.sequences).shape)
+                    if(len(self.sequences) > 4):
+                        self.sequences.pop()
+
+                            # Reverse sequence
+                        # x_test = np.array(self.sequences.reverse())
+                        x_test = np.array(self.sequences)
+                        x_test2 = np.array([x_test])
+                        print(x_test.shape)
+                        print(x_test2.shape)
+
+                        # Predict on values
+                        predictedVals = self.model.predict_on_batch(x_test2)
+                        print(predictedVals.shape)
+                        print(predictedVals)
+                        predictedVals = predictedVals[0]
+                        print(predictedVals.shape)
+                        # Get 3 largest values
+                        likelyMoves = np.argpartition(predictedVals, -5)[-5:]
+                        print(likelyMoves)
+                        # Choose one of these moves randomly
+                        moveIndex = np.random.randint(0, 5)
+                        moveToPerform = likelyMoves[moveIndex]
+                        print(Moves(moveToPerform).name)
+                        pad.perform_move(Moves(moveToPerform))
+                    else:
+                        continue
+
+                    
+
+                    # if(self.toggle):
+                        # pad.perform_move(Moves.UpTiltA)
+                        # pad.tilt_stick(Stick.C, 1, .5)
+                        # pad.press_button(Button.B)
+                        # self.toggle = False
+                    # else:
+                    #     self.toggle = True
+                    # agent.act(self.state, pad)
 
         elif self.state.menu in [menu.value for menu in [Menu.Characters, Menu.Stages]]:
             self.game_frame = 0
-            self.navigate_menus.move(self.state)
+            # self.navigate_menus.move(self.state)
             
             if self.navigate_menus.done():
                 for pid, pad in zip(self.pids, self.pads):
@@ -266,6 +332,91 @@ class CPU(Default):
             self.spam(Button.START)
         else:
             print("Weird menu state", self.state.menu)
+
+
+    def make_action_Ben(self):
+            if self.state.menu == Menu.Game.value:
+                self.game_frame += 1
+                if not self.game_frame % 30 == 0:
+                    return
+                if self.debug and self.game_frame % 60 == 0:
+                  # print('action_frame', self.state.players[0].action_frame)
+                  items = list(util.deepItems(ct.toDict(self.state.players)))
+                  # print('max value', max(items, key=lambda x: abs(x[1])))
+                
+                if self.game_frame <= 120:
+                  return # wait for game to properly load
+                
+                for pid, pad in zip(self.pids, self.pads):
+                    agent = self.agents[pid]
+                    if agent:
+                        # Reset controller to neutral state
+                        pad.send_controller(ssbm.RealControllerState.neutral)
+
+                        # Take screenshot and resize it
+                        img = pyautogui.screenshot()
+                        img = cv2.cvtColor(np.array(img), cv2.COLOR_RGBA2RGB)
+                        x = cv2.resize(img, (150, 150), interpolation=cv2.INTER_LINEAR)
+                        x = img_to_array(x)
+                        x = np.expand_dims(x, axis=0)
+                        x /= 255.
+                        x_test = np.array(x)
+                        x_test2 = np.array([x_test])
+                        # print(x_test.shape)
+                        # print(x_test2.shape)
+
+                        # Predict on values
+                        predictedVals = self.benModel.predict(x)
+                        # print(predictedVals.shape)
+                        # print(predictedVals)
+                        predictedVals = predictedVals[0]
+                        # print("Predicted Values")
+                        # print(predictedVals)
+                        # print(predictedVals.shape)
+
+                        # Get 3 largest values
+                        likelyMoves = np.argpartition(predictedVals, -8)[-8:]
+                        print(likelyMoves)
+                        print("Correct Move:")
+                        print(benMoves(np.argmax(predictedVals)).name)
+
+                        # Choose one of these moves randomly
+                        moveIndex = np.random.randint(0, 8)
+                        moveToPerform = likelyMoves[moveIndex]
+                        print("Performed Move:")
+                        print(benMoves(moveToPerform).name)
+                        pad.perform_move(benMoves(moveToPerform))
+                    else:
+                        continue
+
+                        
+
+                        # if(self.toggle):
+                            # pad.perform_move(Moves.UpTiltA)
+                            # pad.tilt_stick(Stick.C, 1, .5)
+                            # pad.press_button(Button.B)
+                            # self.toggle = False
+                        # else:
+                        #     self.toggle = True
+                        # agent.act(self.state, pad)
+
+            elif self.state.menu in [menu.value for menu in [Menu.Characters, Menu.Stages]]:
+                self.game_frame = 0
+                # self.navigate_menus.move(self.state)
+                
+                if self.navigate_menus.done():
+                    for pid, pad in zip(self.pids, self.pads):
+                        if self.state.menu == Menu.Stages.value:
+                            if self.characters[pid] == 'sheik':
+                                pad.press_button(Button.A)
+                        else:
+                            pad.send_controller(ssbm.RealControllerState.neutral)
+            
+            elif self.state.menu == Menu.PostGame.value:
+                self.spam(Button.START)
+            else:
+                print("Weird menu state", self.state.menu)
+
 
 def runCPU(**kwargs):
   CPU(**kwargs).run()
